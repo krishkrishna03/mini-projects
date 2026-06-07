@@ -1,6 +1,6 @@
 # notes.
 
-A minimal, dark-themed notes app built with React. Supports folders, pinned notes, and a trash bin with restore/permanent delete.
+A minimal, dark-themed notes app built with React. Supports folders, pinned notes, and a trash bin backed by a REST API.
 
 ---
 
@@ -9,8 +9,10 @@ A minimal, dark-themed notes app built with React. Supports folders, pinned note
 - **Folder organization** — 4 built-in folders: Personal, Work, Ideas, Journal
 - **Active / Trash tabs** — switch between live notes and deleted ones
 - **Pin notes** — pinned notes appear at the top of the list
-- **Trash bin** — soft-delete notes, restore or permanently delete them
-- **Empty trash** — bulk-delete all trashed notes with a confirmation modal
+- **Trash bin** — soft-delete via `PATCH`, restore or permanently delete
+- **Empty trash** — `DELETE /notes/trash` tells the backend to purge all deleted records
+- **Optimistic updates** — UI responds instantly; rolls back on API failure
+- **Error toast** — inline error banner if any API call fails
 - **Search** — filters notes by title or body content
 - **Auto-save** — notes save on blur; manual Save button also available
 - **Collapsible sidebar** — toggle with the ☰ button
@@ -23,6 +25,7 @@ A minimal, dark-themed notes app built with React. Supports folders, pinned note
 
 - Node.js 18+
 - A React project scaffold (e.g. Vite or Create React App)
+- A running backend that implements the API contract below
 
 ### Installation
 
@@ -60,14 +63,85 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 
 ---
 
+## API Contract
+
+The app talks to two endpoints. Both helpers live at the top of `NotesApp.jsx` and are easy to swap out.
+
+### `PATCH /api/notes/:id`
+
+Toggles the `isDeleted` flag on a note. Used for soft-delete, restore, and permanent-delete signalling.
+
+**Request body**
+```json
+{ "isDeleted": true }
+```
+or
+```json
+{ "isDeleted": false }
+```
+
+**Response** — the updated note object:
+```json
+{
+  "id": 1,
+  "title": "Meeting Agenda",
+  "isDeleted": true,
+  ...
+}
+```
+
+**Used by**
+
+| Action | Payload |
+|---|---|
+| Move to Trash | `{ isDeleted: true }` |
+| Restore from Trash | `{ isDeleted: false }` |
+| Delete forever (single) | `{ isDeleted: true }` — backend purges on cleanup cycle |
+
+> If your backend exposes a hard `DELETE /notes/:id` route, replace the `permanentDelete` function body with a `fetch(..., { method: 'DELETE' })` call instead.
+
+---
+
+### `DELETE /api/notes/trash`
+
+Instructs the backend to permanently purge all records where `isDeleted = true`. The frontend removes them from local state optimistically before the request completes.
+
+**Response** — either `204 No Content` or:
+```json
+{ "deleted": 6 }
+```
+
+---
+
+### Changing the base URL
+
+`API_BASE` is a constant at the top of `NotesApp.jsx`:
+
+```js
+const API_BASE = "/api"; // change to your backend origin, e.g. "https://api.example.com"
+```
+
+---
+
+## Optimistic Updates & Error Handling
+
+All three API-backed operations (trash, restore, empty trash) follow the same pattern:
+
+1. Update local state immediately so the UI feels instant.
+2. Fire the API call in the background.
+3. On failure, roll back the local state to its previous value.
+4. Surface the error message in a dismissible toast at the bottom of the editor.
+
+While a request is in flight, the relevant note card fades slightly, action buttons are disabled, and a spinner appears inline.
+
+---
+
 ## Project Structure
 
 ```
 src/
-└── NotesApp.jsx       # Single-file component — all logic and UI
+└── NotesApp.jsx       # Single-file component — API helpers, state, and UI
 ```
-
-All state is managed in-memory with React `useState`. There is no backend or localStorage persistence by default (see Customization below).
 
 ---
 
@@ -75,16 +149,18 @@ All state is managed in-memory with React `useState`. There is no backend or loc
 
 | Part | Description |
 |---|---|
+| **API helpers** | `apiPatch(id, body)` and `apiDeleteTrash()` at the top of the file |
 | **Sidebar** | Folder list, note counts, New Note button, search input, Active/Trash tab switcher |
-| **Note List** | Scrollable list of notes filtered by folder/tab/search; shows pinned section |
-| **Editor** | Title (Fraunces italic) + body (DM Mono); folder selector; Save, Pin, Trash/Restore actions |
+| **Note List** | Scrollable list filtered by folder/tab/search; pinned section; loading states per card |
+| **Editor** | Title + body; folder selector; Save, Pin, Trash/Restore actions with spinner feedback |
+| **Error Toast** | Appears at the bottom of the editor on any API failure; dismissible |
 | **Confirm Modal** | Shown before permanent deletion of a single note or emptying trash |
 
 ---
 
 ## Data Model
 
-Each note is a plain object:
+Each note is a plain object in local state:
 
 ```js
 {
@@ -94,9 +170,11 @@ Each note is a plain object:
   folder: String,    // one of the FOLDERS array values
   pinned: Boolean,
   created: String,   // "YYYY-MM-DD"
-  deleted: Boolean   // true = in Trash
+  deleted: Boolean   // mirrors isDeleted on the backend
 }
 ```
+
+The frontend uses `deleted` internally; the API sends and receives `isDeleted` — adjust either side if your field names differ.
 
 ---
 
@@ -117,24 +195,35 @@ const FOLDER_COLORS = {
 };
 ```
 
-### Persist notes to localStorage
+### Add auth headers
 
-Swap the `useState` initializer and add an effect:
+Wrap `apiPatch` and `apiDeleteTrash` to include a token:
 
 ```js
-const [notes, setNotes] = useState(() => {
-  const saved = localStorage.getItem("notes");
-  return saved ? JSON.parse(saved) : INITIAL_NOTES;
-});
-
-useEffect(() => {
-  localStorage.setItem("notes", JSON.stringify(notes));
-}, [notes]);
+async function apiPatch(id, body) {
+  const res = await fetch(`${API_BASE}/notes/${id}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${getToken()}`,
+    },
+    body: JSON.stringify(body),
+  });
+  ...
+}
 ```
 
-### Change the color theme
+### Persist initial notes from the backend
 
-All colors are inline CSS values. A future refactor could extract them into CSS variables at the top of the component for easier theming.
+Replace `INITIAL_NOTES` with a `useEffect` fetch on mount:
+
+```js
+useEffect(() => {
+  fetch(`${API_BASE}/notes`)
+    .then(r => r.json())
+    .then(data => setNotes(data.map(n => ({ ...n, deleted: n.isDeleted }))));
+}, []);
+```
 
 ---
 
@@ -142,8 +231,8 @@ All colors are inline CSS values. A future refactor could extract them into CSS 
 
 Loaded from Google Fonts:
 
-- **[Fraunces](https://fonts.google.com/specimen/Fraunces)** — used for the app wordmark and note titles
-- **[DM Mono](https://fonts.google.com/specimen/DM+Mono)** — used for all body text and UI
+- **[Fraunces](https://fonts.google.com/specimen/Fraunces)** — app wordmark and note titles
+- **[DM Mono](https://fonts.google.com/specimen/DM+Mono)** — all body text and UI
 
 Requires an internet connection on first load. To use offline, download and self-host the font files.
 
@@ -151,8 +240,8 @@ Requires an internet connection on first load. To use offline, download and self
 
 ## Known Limitations
 
-- State is in-memory only — notes reset on page refresh (unless localStorage is added per above)
-- `created` dates are static strings; new notes get today's hardcoded date (`"2026-06-07"`) — replace with `new Date().toISOString().split("T")[0]` for real dates
+- Initial notes are hardcoded in `INITIAL_NOTES` — wire up a `GET /notes` fetch on mount for real data
+- `created` dates are static strings for new notes — replace with `new Date().toISOString().split("T")[0]`
 - No markdown rendering in the editor body
 - No note reordering (drag-and-drop)
 
